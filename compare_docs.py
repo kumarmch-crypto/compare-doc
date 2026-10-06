@@ -55,6 +55,7 @@ from docling_core.types.doc import (
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 from langchain.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -378,6 +379,8 @@ Method:
 4. Group related changes (e.g. a renumbered list, a reworded paragraph split in two)
    into one finding. Every change id must appear in exactly one finding or in
    noise_change_ids.
+5. When finished, call the DiffAnalysis tool exactly once with all findings.
+   Do not answer in plain text.
 
 Significance: high = changes meaning, obligations, numbers, dates, amounts, names,
 scope; medium = noticeable content additions/removals or restructuring;
@@ -422,6 +425,43 @@ def build_vllm_model(base_url: str, model_name: str | None, api_key: str,
                       max_tokens=max_tokens, temperature=temperature, timeout=600)
 
 
+def _parse_analysis_json(text: str) -> DiffAnalysis | None:
+    """Pull a DiffAnalysis out of free text (```json fences, <think> blocks, prose)."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return DiffAnalysis.model_validate_json(text[start: end + 1])
+    except ValueError:
+        return None
+
+
+def extract_analysis(result: dict, model: ChatOpenAI) -> DiffAnalysis:
+    """Local models often end the agent loop with plain text instead of calling
+    the DiffAnalysis tool, leaving structured_response empty. Fall back to
+    (1) parsing JSON from the final answer, (2) asking once more with vLLM's
+    guided JSON decoding, (3) an empty analysis (the reporter then reviews every
+    change itself)."""
+    if result.get("structured_response") is not None:
+        return result["structured_response"]
+
+    print("[analyst] no structured output returned; recovering ...", file=sys.stderr)
+    if parsed := _parse_analysis_json(_message_text(result["messages"][-1])):
+        return parsed
+
+    try:
+        structured = model.with_structured_output(DiffAnalysis, method="json_schema")
+        return structured.invoke([
+            SystemMessage(ANALYST_PROMPT),
+            *result["messages"],
+            HumanMessage("Return all of your findings now as JSON matching the DiffAnalysis schema."),
+        ])
+    except Exception as exc:
+        print(f"[analyst] structured retry failed ({exc}); reporter will review all changes", file=sys.stderr)
+        return DiffAnalysis(findings=[])
+
+
 def run_agents(ws: Workspace, model: ChatOpenAI) -> str:
     tools = ws.build_tools()
     config = {"recursion_limit": 200}
@@ -432,7 +472,7 @@ def run_agents(ws: Workspace, model: ChatOpenAI) -> str:
         {"messages": [{"role": "user", "content": "Analyse all differences between the old and new document."}]},
         config=config,
     )
-    analysis: DiffAnalysis = result["structured_response"]
+    analysis = extract_analysis(result, model)
 
     covered = {i for f in analysis.findings for i in f.change_ids} | set(analysis.noise_change_ids)
     missed = [c.id for c in ws.changes if c.id not in covered]
