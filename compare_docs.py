@@ -85,13 +85,27 @@ def parse_document(converter: DocumentConverter, path: Path) -> DoclingDocument:
     return converter.convert(str(path)).document
 
 
+def table_to_markdown(table: TableItem) -> str:
+    """Render a table from its cell grid. Deliberately avoids Docling's
+    MarkdownDocSerializer, which raises pydantic validation errors when the
+    installed docling / docling-core / pydantic versions don't match."""
+    rows = [[" ".join(cell.text.split()).replace("|", "\\|") for cell in row] for row in table.data.grid]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * width]
+    lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+    return "\n".join(lines)
+
+
 def extract_elements(doc: DoclingDocument) -> list[Element]:
     """Flatten the Docling body tree into reading-order elements."""
     elements: list[Element] = []
     section = "(preamble)"
     for item, _level in doc.iterate_items():
         if isinstance(item, TableItem):
-            kind, text = "table", item.export_to_markdown(doc=doc)
+            kind, text = "table", table_to_markdown(item)
         elif isinstance(item, PictureItem):
             kind, text = "picture", f"[picture] {item.caption_text(doc)}".strip()
         elif isinstance(item, TextItem):
@@ -316,7 +330,11 @@ class Workspace:
         def export_markdown(version: Version, offset: int = 0) -> str:
             """The whole 'old' or 'new' document as Markdown (Docling export), paged by
             character offset. Prefer the targeted tools; use this for global context."""
-            md = ws.docs[version].export_to_markdown()
+            try:
+                md = ws.docs[version].export_to_markdown()
+            except Exception:  # serializer/version mismatch: rebuild from parsed elements
+                md = "\n\n".join(("## " + e.text) if e.kind in ("title", "section_header") else e.text
+                                   for e in ws.elements[version])
             chunk = md[offset: offset + MAX_TOOL_CHARS]
             more = f"\n… [{len(md) - offset - len(chunk)} more chars, next offset {offset + len(chunk)}]" \
                 if offset + len(chunk) < len(md) else ""
